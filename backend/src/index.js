@@ -58,6 +58,7 @@ const app = express();
 // Trust the configured number of proxy hops so req.ip reflects the real client
 // (via X-Forwarded-For) behind a reverse proxy — required for correct IP-based
 // rate limiting. Defaults to false (no proxy) to avoid X-Forwarded-For spoofing.
+// #569: hop count must match deployment topology (see backend README).
 app.set("trust proxy", config.trustProxy);
 
 app.use(requestLogger);

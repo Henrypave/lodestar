@@ -5,6 +5,7 @@ use soroban_sdk::{
     IntoVal, String, Symbol, Vec,
 };
 
+// #570: production TTL — deliberate value, not the test-inflated one.
 const MAX_TTL: u32 = 100_000_000;
 #[cfg(not(test))]
 const DAY_LEDGERS: u64 = 17_280;
