@@ -15,7 +15,7 @@ import {
 } from "../lib/contract.js";
 import { getCurrentLedgerSequence } from "../lib/stellar.js";
 import { getReputationHistory } from "../lib/reputationHistory.js";
-import logger from "../lib/logger.js";
+import logger, { requestContext } from "../lib/logger.js";
 import { ContractError } from "../lib/ContractError.js";
 import { writeRateLimiter } from "../middleware/rateLimiter.js";
 import { isValidStellarAddress } from "../middleware/addressValidator.js";
@@ -94,6 +94,13 @@ function annotateTtlWarning(service, currentLedger) {
   };
 }
 
+// Returns a request-scoped child logger that always carries the request id.
+// Falls back to the root logger when the AsyncLocalStorage context is missing.
+function requestLogger(req) {
+  const requestId = requestContext.getStore()?.requestId ?? req?.id;
+  return requestId ? logger.child({ requestId }) : logger;
+}
+
 router.get("/services", async (req, res) => {
   try {
     const { category, q, offset: offsetStr, limit: limitStr } = req.query;
@@ -110,7 +117,7 @@ router.get("/services", async (req, res) => {
     if (ledgerResult.status === "rejected") {
       logger.warn(
         { err: ledgerResult.reason },
-        "Failed to fetch current ledger for TTL annotation on GET /api/services",
+        "Failed to fetch current ledger for TT \ annotation on GET /api/services",
       );
     }
 
@@ -266,6 +273,14 @@ router.get("/services/:id/history", async (req, res) => {
 });
 
 router.get("/stats", async (req, res) => {
+  const log = requestLogger(req);
+  const startedAt = process.hrtime.bigint();
+  const contractStartedAt = process.hrtime.bigint();
+  const context = {
+    route: "GET /stats",
+    callerAddress: req.ip,
+  };
+
   try {
     const totalServices = await getServiceCount();
     const totalPages = Math.ceil(totalServices / PAGE_SIZE);
@@ -282,9 +297,40 @@ router.get("/stats", async (req, res) => {
       null,
     );
 
+    const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+    const contractDurationMs = Number(process.hrtime.bigint() - contractStartedAt) / 1e6;
+
+    log.info(
+      {
+        ...context,
+        outcome: "success",
+        statusCode: res.statusCode,
+        durationMs,
+        contractDurationMs,
+        totalServices,
+        categoryCount: categories.length,
+        latestServiceId: latestService?.id ?? null,
+      },
+      "GET /api/stats completed",
+    );
+
     res.json({ totalServices, categories, latestService });
   } catch (err) {
-    logger.error({ err }, "GET /api/stats failed");
+    const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+    const contractDurationMs = Number(process.hrtime.bigint() - contractStartedAt) / 1e6;
+
+    log.error(
+      {
+        ...context,
+        err,
+        outcome: "error",
+        statusCode: 500,
+        durationMs,
+        contractDurationMs,
+        errorCode: err instanceof ContractError ? err.code : undefined,
+      },
+      "GET /api/stats failed",
+    );
     res.status(500).json({ error: "Failed to fetch stats", code: "FETCH_ERROR" });
   }
 });
@@ -330,237 +376,8 @@ router.get("/registry/by-provider/:address", async (req, res) => {
         return res.status(504).json({ error: err.message, code: err.code });
       }
     }
-    logger.error({ err, address: req.params.address }, "GET /api/registry/by-provider/:address failed");
+    logger.error({ err }, "GET /api/registry/by-provider/:address failed");
     res.status(500).json({ error: "Failed to fetch services", code: "FETCH_ERROR" });
-  }
-});
-
-router.post("/registry/prepare-register", writeRateLimiter(), async (req, res) => {
-  try {
-    const {
-      name,
-      description,
-      endpoint,
-      priceUsdc,
-      category,
-      providerAddress,
-      payTo,
-    } = req.body ?? {};
-
-    if (!isValidStellarAddress(providerAddress)) {
-      return res.status(400).json({ error: "`providerAddress` must be a valid Stellar address", code: "INVALID_BODY" });
-    }
-    if (typeof name !== "string" || name.trim().length < 3 || name.trim().length > 64) {
-      return res.status(400).json({ error: "`name` must be 3-64 characters", code: "INVALID_BODY" });
-    }
-    if (typeof description !== "string" || description.trim().length < 10 || description.trim().length > 256) {
-      return res.status(400).json({ error: "`description` must be 10-256 characters", code: "INVALID_BODY" });
-    }
-    if (typeof endpoint !== "string" || !endpoint.startsWith("https://")) {
-      return res.status(400).json({ error: "`endpoint` must start with https://", code: "INVALID_BODY" });
-    }
-    if (endpoint.trim().length > 256) {
-      return res.status(400).json({ error: "`endpoint` must be at most 256 characters", code: "INVALID_BODY" });
-    }
-    if (!SERVICE_CATEGORIES.has(category)) {
-      return res.status(400).json({ error: "`category` is invalid", code: "INVALID_BODY" });
-    }
-
-    const normalizedPriceUsdc = normalizePriceUsdc(priceUsdc);
-    if (!normalizedPriceUsdc) {
-      return res.status(400).json({ error: "`priceUsdc` must be at least 0.0001", code: "INVALID_BODY" });
-    }
-    if (payTo !== undefined && (typeof payTo !== "string" || payTo.trim().length === 0)) {
-      return res.status(400).json({ error: "`payTo` must be a non-empty string when provided", code: "INVALID_BODY" });
-    }
-
-    const prepared = await buildUnsignedRegistryTx("register", providerAddress, {
-      name: name.trim(),
-      description: description.trim(),
-      endpoint: endpoint.trim(),
-      priceUsdc: normalizedPriceUsdc,
-      category,
-      payTo: payTo?.trim(),
-    });
-    logger.info({ providerAddress, endpoint, category }, "Built unsigned registry registration tx");
-    res.json(prepared);
-  } catch (err) {
-    if (err instanceof ContractError) {
-      const status = err.code === "TRANSACTION_TIMEOUT" ? 504 : err.code === "DUPLICATE_SERVICE" ? 409 : 400;
-      return res.status(status).json({ error: err.message, code: err.code });
-    }
-    logger.error({ err }, "POST /api/registry/prepare-register failed");
-    res.status(500).json({ error: "Failed to build transaction", code: "BUILD_TX_ERROR" });
-  }
-});
-
-router.post("/registry/prepare-deactivate", writeRateLimiter(), async (req, res) => {
-  try {
-    const { providerAddress, id } = req.body ?? {};
-    if (!isValidStellarAddress(providerAddress)) {
-      return res.status(400).json({ error: "`providerAddress` must be a valid Stellar address", code: "INVALID_BODY" });
-    }
-
-    const parsedId = parsePositiveSafeInteger(id);
-    if (parsedId == null) {
-      return res.status(400).json({ error: "`id` must be a positive integer", code: "INVALID_BODY" });
-    }
-
-    const prepared = await buildUnsignedRegistryTx("deactivate", providerAddress, { id: parsedId });
-    logger.info({ providerAddress, id: parsedId }, "Built unsigned registry deactivation tx");
-    res.json(prepared);
-  } catch (err) {
-    if (err instanceof ContractError) {
-      const status = err.code === "TRANSACTION_TIMEOUT" ? 504 : 400;
-      return res.status(status).json({ error: err.message, code: err.code });
-    }
-    logger.error({ err }, "POST /api/registry/prepare-deactivate failed");
-    res.status(500).json({ error: "Failed to build transaction", code: "BUILD_TX_ERROR" });
-  }
-});
-
-router.post("/registry/prepare-reactivate", writeRateLimiter(), async (req, res) => {
-  try {
-    const { providerAddress, id } = req.body ?? {};
-    if (!isValidStellarAddress(providerAddress)) {
-      return res.status(400).json({ error: "`providerAddress` must be a valid Stellar address", code: "INVALID_BODY" });
-    }
-
-    const parsedId = parsePositiveSafeInteger(id);
-    if (parsedId == null) {
-      return res.status(400).json({ error: "`id` must be a positive integer", code: "INVALID_BODY" });
-    }
-
-    const prepared = await buildUnsignedRegistryTx("reactivate", providerAddress, { id: parsedId });
-    logger.info({ providerAddress, id: parsedId }, "Built unsigned registry reactivation tx");
-    res.json(prepared);
-  } catch (err) {
-    if (err instanceof ContractError) {
-      const status = err.code === "TRANSACTION_TIMEOUT" ? 504 : 400;
-      return res.status(status).json({ error: err.message, code: err.code });
-    }
-    logger.error({ err }, "POST /api/registry/prepare-reactivate failed");
-    res.status(500).json({ error: "Failed to build transaction", code: "BUILD_TX_ERROR" });
-  }
-});
-
-router.post("/registry/submit-signed-tx", writeRateLimiter(), async (req, res) => {
-  try {
-    const { signedXdr, submitToken } = req.body ?? {};
-    if (!signedXdr || typeof signedXdr !== "string") {
-      return res.status(400).json({ error: "`signedXdr` is required", code: "INVALID_BODY" });
-    }
-    if (!submitToken || typeof submitToken !== "string") {
-      return res.status(400).json({ error: "`submitToken` is required", code: "INVALID_BODY" });
-    }
-    validatePreparedRegistrySubmission(submitToken, signedXdr);
-
-    const result = await submitSignedRegistryTx(signedXdr);
-    logger.info({ hash: result.hash, id: result.id }, "Submitted wallet-signed registry tx");
-    res.json({ success: true, ...result });
-  } catch (err) {
-    if (err instanceof ContractError) {
-      const status = err.code === "TRANSACTION_TIMEOUT" ? 504 : 400;
-      return res.status(status).json({ error: err.message, code: err.code });
-    }
-    logger.error({ err }, "POST /api/registry/submit-signed-tx failed");
-    res.status(500).json({ error: "Failed to submit transaction", code: "SUBMIT_TX_ERROR" });
-  }
-});
-
-// POST /api/reputation/:id — Body: { positive: boolean, agent: string }
-// `agent` must be a registered agent the backend is allowed to sign for. The
-// on-chain contract enforces require_auth + agent registration + a per-agent
-// cooldown, so reputation can no longer be moved by anonymous callers.
-router.post("/reputation/:id", writeRateLimiter(), async (req, res) => {
-  let id;
-  try {
-    id = parseInt(req.params.id, 10);
-    if (isNaN(id) || id < 1) {
-      return res
-        .status(400)
-        .json({ error: "Invalid service ID", code: "INVALID_ID" });
-    }
-
-    // Default to {} so a missing/non-JSON body yields a 400 INVALID_BODY rather
-    // than a TypeError surfacing as a generic 500.
-    const { positive, agent } = req.body ?? {};
-    if (typeof positive !== "boolean") {
-      return res
-        .status(400)
-        .json({ error: "`positive` must be a boolean", code: "INVALID_BODY" });
-    }
-    if (!isValidStellarAddress(agent)) {
-      return res.status(400).json({
-        error: "`agent` must be a valid Stellar address",
-        code: "INVALID_BODY",
-      });
-    }
-    if (!isAllowedReputationAgent(agent)) {
-      return res.status(403).json({
-        error:
-          "This agent is not permitted to vote through the hosted backend. Only registered demo agents may; other agents must submit a wallet-signed transaction.",
-        code: "AGENT_NOT_ALLOWED",
-      });
-    }
-
-    const newReputation = await updateReputation(id, positive, agent);
-    res.json({ success: true, newReputation });
-  } catch (err) {
-    // SIMULATION_FAILED covers on-chain rejections such as the vote cooldown
-    // or an unregistered agent — surface it as an actionable 400.
-    if (err instanceof ContractError) {
-      if (err.code === "AGENT_NOT_ALLOWED") {
-        return res.status(403).json({ error: err.message, code: err.code });
-      }
-      if (err.code === "TRANSACTION_TIMEOUT") {
-        return res.status(504).json({ error: err.message, code: err.code });
-      }
-      return res.status(400).json({ error: err.message, code: err.code });
-    }
-    logger.error({ err, id }, "POST /api/reputation/:id failed");
-    res.status(500).json({ error: "Failed to update reputation", code: "UPDATE_ERROR" });
-  }
-});
-
-/**
- * Liveness (#841).
- *
- * Deliberately dependency-free: it answers "is this process running?" and
- * nothing else. Touching RPC here would make an orchestrator restart a healthy
- * instance whose only problem is a slow upstream — use /api/ready for that.
- */
-router.get("/health", async (req, res) => {
-  const { default: config } = await import("../config.js");
-  res.json({
-    status: "ok",
-    network: config.stellar.network,
-    contractId: config.contract.id,
-    uptimeSeconds: Math.floor(process.uptime()),
-    timestamp: new Date().toISOString(),
-  });
-});
-
-/**
- * Readiness (#841).
- *
- * Checks the dependencies needed to actually serve traffic, each under a short
- * timeout. Returns 503 when a required dependency is unreachable so the
- * orchestrator stops routing here without restarting the process.
- */
-router.get("/ready", async (req, res) => {
-  const { checkReadiness } = await import("../lib/readiness.js");
-  try {
-    const result = await checkReadiness();
-    res.status(result.ready ? 200 : 503).json(result);
-  } catch (err) {
-    logger.error({ err }, "GET /api/ready failed");
-    res.status(503).json({
-      ready: false,
-      status: "not_ready",
-      error: "Readiness check failed",
-      timestamp: new Date().toISOString(),
-    });
   }
 });
 
